@@ -5,6 +5,7 @@ A chatbot that can answer questions about any website by crawling and indexing i
 
 import streamlit as st
 import os
+import time
 from crawler import WebCrawler
 from text_processor import TextProcessor
 from vector_store import VectorStore
@@ -24,19 +25,22 @@ def initialize_session_state():
         st.session_state.chatbot = RAGChatbot(st.session_state.vector_store)
     if 'messages' not in st.session_state:
         st.session_state.messages = []
-    if 'crawled_url' not in st.session_state:
-        st.session_state.crawled_url = None
+    if 'crawled_urls' not in st.session_state:
+        st.session_state.crawled_urls = []
     if 'crawl_stats' not in st.session_state:
         st.session_state.crawl_stats = None
     if 'is_indexed' not in st.session_state:
         st.session_state.is_indexed = False
+    if 'all_crawl_stats' not in st.session_state:
+        st.session_state.all_crawl_stats = []
 
 def check_api_key():
     """Check if OpenAI API key is configured"""
     return os.environ.get("OPENAI_API_KEY") is not None
 
-def crawl_and_index_website(url: str, max_depth: int, max_pages: int):
+def crawl_and_index_website(url: str, max_depth: int, max_pages: int, append_mode: bool = False):
     """Crawl website and build knowledge base"""
+    start_time = time.time()
     progress_container = st.empty()
     status_container = st.empty()
     
@@ -62,6 +66,8 @@ def crawl_and_index_website(url: str, max_depth: int, max_pages: int):
         st.error(f"Crawling error: {e}")
         return False
     
+    crawl_time = time.time() - start_time
+    
     if not crawled_data:
         st.warning("No content could be extracted from the website. The site may block crawling or have no accessible content.")
         return False
@@ -69,7 +75,7 @@ def crawl_and_index_website(url: str, max_depth: int, max_pages: int):
     progress_container.empty()
     
     with status_container.container():
-        st.success(f"Crawled {crawl_summary['pages_crawled']} pages successfully!")
+        st.success(f"Crawled {crawl_summary['pages_crawled']} pages in {crawl_time:.1f}s!")
         st.write("**Phase 2: Processing Text**")
         process_progress = st.progress(0)
     
@@ -85,6 +91,7 @@ def crawl_and_index_website(url: str, max_depth: int, max_pages: int):
     
     status_container.empty()
     
+    embed_start_time = time.time()
     with st.container():
         st.write("**Phase 3: Building Knowledge Base**")
         embed_progress = st.progress(0)
@@ -95,32 +102,100 @@ def crawl_and_index_website(url: str, max_depth: int, max_pages: int):
         embed_status.text(f"Embedding chunks: {current}/{total}")
     
     try:
-        st.session_state.vector_store.build_index(chunks, progress_callback=embed_callback)
+        if append_mode and st.session_state.is_indexed:
+            st.session_state.vector_store.add_chunks(chunks, progress_callback=embed_callback)
+        else:
+            st.session_state.vector_store.build_index(chunks, progress_callback=embed_callback)
     except Exception as e:
         st.error(f"Error building knowledge base: {e}")
         return False
     
-    st.session_state.crawled_url = url
-    st.session_state.crawl_stats = {
-        **crawl_summary,
-        **process_stats
+    embed_time = time.time() - embed_start_time
+    total_time = time.time() - start_time
+    
+    this_crawl_stats = {
+        'url': url,
+        'pages_crawled': crawl_summary['pages_crawled'],
+        'total_chunks': process_stats['total_chunks'],
+        'total_tokens': process_stats['total_tokens'],
+        'crawl_time': round(crawl_time, 1),
+        'embed_time': round(embed_time, 1),
+        'total_time': round(total_time, 1),
+        'pages': crawl_summary.get('pages', [])
     }
+    
+    if not append_mode:
+        st.session_state.all_crawl_stats = []
+        st.session_state.crawled_urls = []
+    
+    st.session_state.all_crawl_stats.append(this_crawl_stats)
+    
+    if url not in st.session_state.crawled_urls:
+        st.session_state.crawled_urls.append(url)
+    
+    total_stats = {
+        'pages_crawled': sum(s['pages_crawled'] for s in st.session_state.all_crawl_stats),
+        'total_chunks': sum(s['total_chunks'] for s in st.session_state.all_crawl_stats),
+        'total_tokens': sum(s['total_tokens'] for s in st.session_state.all_crawl_stats),
+        'total_time': sum(s['total_time'] for s in st.session_state.all_crawl_stats),
+        'urls_count': len(st.session_state.crawled_urls)
+    }
+    st.session_state.crawl_stats = total_stats
+    
     st.session_state.is_indexed = True
-    st.session_state.messages = []
-    st.session_state.chatbot.clear_history()
+    
+    if not append_mode:
+        st.session_state.messages = []
+        st.session_state.chatbot.clear_history()
     
     return True
 
+def display_crawl_statistics():
+    """Display detailed crawl statistics dashboard"""
+    if not st.session_state.all_crawl_stats:
+        return
+    
+    st.subheader("📊 Crawl Statistics Dashboard")
+    
+    stats = st.session_state.crawl_stats
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Pages", stats.get('pages_crawled', 0))
+    with col2:
+        st.metric("Text Chunks", stats.get('total_chunks', 0))
+    with col3:
+        st.metric("Total Tokens", f"{stats.get('total_tokens', 0):,}")
+    
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        st.metric("URLs Indexed", stats.get('urls_count', 0))
+    with col5:
+        st.metric("Total Time", f"{stats.get('total_time', 0):.1f}s")
+    with col6:
+        avg_tokens = stats.get('total_tokens', 0) // max(stats.get('total_chunks', 1), 1)
+        st.metric("Avg Tokens/Chunk", avg_tokens)
+    
+    if len(st.session_state.all_crawl_stats) > 0:
+        with st.expander("📋 Crawled URLs Details"):
+            for i, crawl in enumerate(st.session_state.all_crawl_stats, 1):
+                st.markdown(f"**{i}. {crawl['url']}**")
+                st.markdown(f"   - Pages: {crawl['pages_crawled']} | Chunks: {crawl['total_chunks']} | Tokens: {crawl['total_tokens']:,}")
+                st.markdown(f"   - Crawl time: {crawl['crawl_time']}s | Embed time: {crawl['embed_time']}s")
+
 def display_chat_interface():
-    """Display the chat interface"""
+    """Display the chat interface with enhanced citations"""
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message["role"] == "assistant" and "sources" in message:
                 if message["sources"]:
-                    with st.expander("📚 Sources"):
-                        for source in message["sources"]:
-                            st.markdown(f"- [{source['title']}]({source['url']}) (relevance: {source['relevance_score']})")
+                    with st.expander("📚 Sources & Citations"):
+                        for i, source in enumerate(message["sources"], 1):
+                            relevance_pct = int(source['relevance_score'] * 100)
+                            st.markdown(f"**[{i}]** [{source['title']}]({source['url']})")
+                            st.progress(relevance_pct / 100, text=f"Relevance: {relevance_pct}%")
+                if message.get("chunks_used"):
+                    st.caption(f"Used {message['chunks_used']} context chunks")
     
     if prompt := st.chat_input("Ask a question about the website..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -134,14 +209,20 @@ def display_chat_interface():
             st.markdown(response['answer'])
             
             if response.get('sources'):
-                with st.expander("📚 Sources"):
-                    for source in response['sources']:
-                        st.markdown(f"- [{source['title']}]({source['url']}) (relevance: {source['relevance_score']})")
+                with st.expander("📚 Sources & Citations"):
+                    for i, source in enumerate(response['sources'], 1):
+                        relevance_pct = int(source['relevance_score'] * 100)
+                        st.markdown(f"**[{i}]** [{source['title']}]({source['url']})")
+                        st.progress(relevance_pct / 100, text=f"Relevance: {relevance_pct}%")
+            
+            if response.get('chunks_retrieved'):
+                st.caption(f"Used {response['chunks_retrieved']} context chunks")
         
         st.session_state.messages.append({
             "role": "assistant",
             "content": response['answer'],
-            "sources": response.get('sources', [])
+            "sources": response.get('sources', []),
+            "chunks_used": response.get('chunks_retrieved', 0)
         })
 
 def main():
@@ -150,10 +231,11 @@ def main():
     st.title("🤖 Website RAG Chatbot")
     st.markdown("*Crawl any website and ask questions about its content*")
     
-    if not check_api_key():
+    api_key_configured = check_api_key()
+    
+    if not api_key_configured:
         st.error("⚠️ OpenAI API Key is not configured. Please add your OPENAI_API_KEY to the Secrets.")
         st.info("Go to the Secrets tab in Replit and add your OpenAI API key.")
-        return
     
     with st.sidebar:
         st.header("🌐 Website Configuration")
@@ -180,28 +262,46 @@ def main():
                 help="Maximum number of pages to crawl"
             )
         
-        if st.button("🚀 Crawl & Build Knowledge Base", type="primary", use_container_width=True):
+        if st.session_state.is_indexed:
+            crawl_mode = st.radio(
+                "Crawl Mode",
+                options=["Replace existing", "Add to existing"],
+                index=0,
+                help="Choose whether to replace or add to the current knowledge base"
+            )
+            append_mode = crawl_mode == "Add to existing"
+        else:
+            append_mode = False
+        
+        crawl_disabled = not api_key_configured
+        if st.button("🚀 Crawl & Build Knowledge Base", type="primary", use_container_width=True, disabled=crawl_disabled):
             if not url:
                 st.error("Please enter a URL")
             else:
                 with st.spinner("Processing..."):
-                    success = crawl_and_index_website(url, max_depth, max_pages)
+                    success = crawl_and_index_website(url, max_depth, max_pages, append_mode)
                     if success:
                         st.success("Knowledge base built successfully!")
                         st.rerun()
         
+        if crawl_disabled:
+            st.warning("Add OpenAI API key to enable crawling")
+        
         st.divider()
         
         if st.session_state.crawl_stats:
-            st.header("📊 Knowledge Base Stats")
+            st.header("📊 Quick Stats")
             stats = st.session_state.crawl_stats
             
             st.metric("Pages Crawled", stats.get('pages_crawled', 0))
             st.metric("Text Chunks", stats.get('total_chunks', 0))
             st.metric("Total Tokens", f"{stats.get('total_tokens', 0):,}")
+            st.metric("URLs Indexed", stats.get('urls_count', 0))
             
-            if st.session_state.crawled_url:
-                st.caption(f"Source: {st.session_state.crawled_url}")
+            if st.session_state.crawled_urls:
+                st.caption("**Indexed URLs:**")
+                for url in st.session_state.crawled_urls:
+                    st.caption(f"• {url[:40]}...")
         
         st.divider()
         
@@ -214,14 +314,25 @@ def main():
             st.session_state.vector_store.clear()
             st.session_state.messages = []
             st.session_state.chatbot.clear_history()
-            st.session_state.crawled_url = None
+            st.session_state.crawled_urls = []
             st.session_state.crawl_stats = None
             st.session_state.is_indexed = False
+            st.session_state.all_crawl_stats = []
             st.rerun()
     
     if st.session_state.is_indexed:
-        st.success(f"✅ Knowledge base ready! Ask questions about: **{st.session_state.crawled_url}**")
-        display_chat_interface()
+        urls_text = ", ".join(st.session_state.crawled_urls[:3])
+        if len(st.session_state.crawled_urls) > 3:
+            urls_text += f" (+{len(st.session_state.crawled_urls) - 3} more)"
+        st.success(f"✅ Knowledge base ready! Indexed: **{urls_text}**")
+        
+        tab1, tab2 = st.tabs(["💬 Chat", "📊 Statistics"])
+        
+        with tab1:
+            display_chat_interface()
+        
+        with tab2:
+            display_crawl_statistics()
     else:
         st.info("👈 Enter a website URL in the sidebar and click 'Crawl & Build Knowledge Base' to get started.")
         
@@ -245,6 +356,18 @@ def main():
         with col4:
             st.markdown("**4. Ask Questions**")
             st.markdown("Chat with your knowledge base")
+        
+        st.markdown("---")
+        st.markdown("### Features")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("- 🔗 Crawl multiple URLs and merge knowledge bases")
+            st.markdown("- 📊 Detailed crawl statistics dashboard")
+            st.markdown("- 📚 Source citations with relevance scores")
+        with col2:
+            st.markdown("- 🔄 Add or replace existing knowledge base")
+            st.markdown("- ⚡ Fast semantic search with FAISS")
+            st.markdown("- 💬 Conversational chat interface")
 
 if __name__ == "__main__":
     main()

@@ -93,9 +93,20 @@ This application allows users to:
 ### Chat Interface
 - Natural language question input
 - Context-aware answer generation using GPT-5
-- Source citations with links
+- Source citations with relevance scores and progress bars
 - Conversation history support
 - Clear chat/reset functionality
+
+### Multiple URL Support
+- Crawl multiple websites and merge into single knowledge base
+- Choose between "Replace" or "Add to existing" modes
+- Track all indexed URLs with individual statistics
+
+### Crawl Statistics Dashboard
+- Real-time crawl timing (crawl time, embed time, total time)
+- Token and chunk counts per URL
+- Detailed per-URL statistics in expandable view
+- Average tokens per chunk metrics
 
 ### Error Handling
 - Invalid URL validation

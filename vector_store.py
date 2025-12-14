@@ -96,6 +96,28 @@ class VectorStore:
         
         return True
     
+    def add_chunks(self, chunks: List[Dict], progress_callback=None) -> bool:
+        """Add new chunks to existing index (for multiple URL support)"""
+        try:
+            import faiss
+        except ImportError:
+            raise ImportError("FAISS not installed. Please install faiss-cpu.")
+        
+        if not chunks:
+            return False
+        
+        if self.index is None:
+            return self.build_index(chunks, progress_callback)
+        
+        texts = [chunk['text'] for chunk in chunks]
+        embeddings = self.generate_embeddings_batch(texts, progress_callback)
+        
+        faiss.normalize_L2(embeddings)
+        self.index.add(embeddings)
+        self.chunks.extend(chunks)
+        
+        return True
+    
     def search(self, query: str, top_k: int = 5) -> List[Tuple[Dict, float]]:
         """Search for most relevant chunks"""
         try:
