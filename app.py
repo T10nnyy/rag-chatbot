@@ -1,6 +1,7 @@
 """
 RAG-Based Website Chatbot - Streamlit UI
 A chatbot that can answer questions about any website by crawling and indexing its content.
+Supports both OpenAI and Google Gemini models.
 """
 
 import streamlit as st
@@ -10,6 +11,10 @@ from crawler import WebCrawler
 from text_processor import TextProcessor
 from vector_store import VectorStore
 from rag_chatbot import RAGChatbot
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 st.set_page_config(
     page_title="Website RAG Chatbot",
@@ -19,10 +24,22 @@ st.set_page_config(
 
 def initialize_session_state():
     """Initialize session state variables"""
+    if 'embedding_provider' not in st.session_state:
+        st.session_state.embedding_provider = "openai"
     if 'vector_store' not in st.session_state:
-        st.session_state.vector_store = VectorStore()
+        st.session_state.vector_store = VectorStore(
+            embedding_provider=st.session_state.embedding_provider
+        )
+    if 'selected_provider' not in st.session_state:
+        st.session_state.selected_provider = "gemini"
+    if 'selected_model' not in st.session_state:
+        st.session_state.selected_model = "gemini-2.0-flash"
     if 'chatbot' not in st.session_state:
-        st.session_state.chatbot = RAGChatbot(st.session_state.vector_store)
+        st.session_state.chatbot = RAGChatbot(
+            st.session_state.vector_store,
+            model=st.session_state.selected_model,
+            provider=st.session_state.selected_provider
+        )
     if 'messages' not in st.session_state:
         st.session_state.messages = []
     if 'crawled_urls' not in st.session_state:
@@ -34,9 +51,53 @@ def initialize_session_state():
     if 'all_crawl_stats' not in st.session_state:
         st.session_state.all_crawl_stats = []
 
-def check_api_key():
-    """Check if OpenAI API key is configured"""
-    return os.environ.get("OPENAI_API_KEY") is not None
+def check_api_keys():
+    """Check which API keys are configured"""
+    return {
+        'openai': os.environ.get("OPENAI_API_KEY") is not None,
+        'gemini': os.environ.get("GEMINI_API_KEY") is not None
+    }
+
+def update_chatbot_model(provider: str, model: str):
+    """Update the chatbot with a new model"""
+    st.session_state.selected_provider = provider
+    st.session_state.selected_model = model
+    st.session_state.chatbot = RAGChatbot(
+        st.session_state.vector_store,
+        model=model,
+        provider=provider
+    )
+    # Preserve conversation history
+    if hasattr(st.session_state, 'messages'):
+        for msg in st.session_state.messages:
+            if msg['role'] == 'user':
+                st.session_state.chatbot.conversation_history.append({
+                    'role': 'user',
+                    'content': msg['content']
+                })
+            elif msg['role'] == 'assistant':
+                st.session_state.chatbot.conversation_history.append({
+                    'role': 'assistant',
+                    'content': msg['content']
+                })
+
+def update_embedding_provider(provider: str):
+    """Update the embedding provider and recreate vector store"""
+    if provider != st.session_state.embedding_provider:
+        st.session_state.embedding_provider = provider
+        st.session_state.vector_store = VectorStore(embedding_provider=provider)
+        st.session_state.chatbot = RAGChatbot(
+            st.session_state.vector_store,
+            model=st.session_state.selected_model,
+            provider=st.session_state.selected_provider
+        )
+        # Clear index as embeddings are incompatible
+        st.session_state.is_indexed = False
+        st.session_state.crawled_urls = []
+        st.session_state.crawl_stats = None
+        st.session_state.all_crawl_stats = []
+        st.session_state.messages = []
+        st.warning("⚠️ Embedding provider changed. Please re-crawl websites to rebuild the knowledge base.")
 
 def crawl_and_index_website(url: str, max_depth: int, max_pages: int, append_mode: bool = False):
     """Crawl website and build knowledge base"""
@@ -175,6 +236,10 @@ def display_crawl_statistics():
         avg_tokens = stats.get('total_tokens', 0) // max(stats.get('total_chunks', 1), 1)
         st.metric("Avg Tokens/Chunk", avg_tokens)
     
+    # Display embedding info
+    index_stats = st.session_state.vector_store.get_index_stats()
+    st.info(f"🔢 Embedding Model: **{index_stats['provider'].upper()} - {index_stats['model']}** | Dimensions: {index_stats['embedding_dim']}")
+    
     if len(st.session_state.all_crawl_stats) > 0:
         with st.expander("📋 Crawled URLs Details"):
             for i, crawl in enumerate(st.session_state.all_crawl_stats, 1):
@@ -195,7 +260,11 @@ def display_chat_interface():
                             st.markdown(f"**[{i}]** [{source['title']}]({source['url']})")
                             st.progress(relevance_pct / 100, text=f"Relevance: {relevance_pct}%")
                 if message.get("chunks_used"):
-                    st.caption(f"Used {message['chunks_used']} context chunks")
+                    model_info = message.get("model_used", "")
+                    caption = f"Used {message['chunks_used']} context chunks"
+                    if model_info:
+                        caption += f" • Model: {model_info}"
+                    st.caption(caption)
     
     if prompt := st.chat_input("Ask a question about the website..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -216,13 +285,18 @@ def display_chat_interface():
                         st.progress(relevance_pct / 100, text=f"Relevance: {relevance_pct}%")
             
             if response.get('chunks_retrieved'):
-                st.caption(f"Used {response['chunks_retrieved']} context chunks")
+                model_info = response.get('model_used', '')
+                caption = f"Used {response['chunks_retrieved']} context chunks"
+                if model_info:
+                    caption += f" • Model: {model_info}"
+                st.caption(caption)
         
         st.session_state.messages.append({
             "role": "assistant",
             "content": response['answer'],
             "sources": response.get('sources', []),
-            "chunks_used": response.get('chunks_retrieved', 0)
+            "chunks_used": response.get('chunks_retrieved', 0),
+            "model_used": response.get('model_used', '')
         })
 
 def main():
@@ -231,13 +305,94 @@ def main():
     st.title("🤖 Website RAG Chatbot")
     st.markdown("*Crawl any website and ask questions about its content*")
     
-    api_key_configured = check_api_key()
-    
-    if not api_key_configured:
-        st.error("⚠️ OpenAI API Key is not configured. Please add your OPENAI_API_KEY to the Secrets.")
-        st.info("Go to the Secrets tab in Replit and add your OpenAI API key.")
+    api_keys = check_api_keys()
     
     with st.sidebar:
+        st.header("🔢 Embedding Configuration")
+        
+        # Embedding provider selection
+        embed_options = []
+        if api_keys['openai']:
+            embed_options.append("OpenAI")
+        if api_keys['gemini']:
+            embed_options.append("Gemini")
+        
+        if not embed_options:
+            st.error("⚠️ No API keys configured!")
+        else:
+            current_embed = "OpenAI" if st.session_state.embedding_provider == "openai" else "Gemini"
+            if current_embed not in embed_options:
+                current_embed = embed_options[0]
+            
+            embed_provider = st.selectbox(
+                "Embedding Provider",
+                options=embed_options,
+                index=embed_options.index(current_embed) if current_embed in embed_options else 0,
+                help="Provider used to generate text embeddings for search"
+            )
+            
+            embed_provider_key = "openai" if embed_provider == "OpenAI" else "gemini"
+            
+            if embed_provider_key != st.session_state.embedding_provider:
+                if st.session_state.is_indexed:
+                    st.warning("⚠️ Changing embedding provider will clear the current index")
+                    if st.button("Confirm Change", type="primary", key="confirm_embed_change"):
+                        update_embedding_provider(embed_provider_key)
+                        st.rerun()
+                else:
+                    update_embedding_provider(embed_provider_key)
+            
+            # Show embedding model info
+            if embed_provider_key == "openai":
+                st.caption("📊 Model: text-embedding-3-small (1536 dims)")
+            else:
+                st.caption("📊 Model: text-embedding-004 (768 dims)")
+        
+        st.divider()
+        
+        st.header("🤖 Chat Model Configuration")
+        
+        # Model selection
+        provider_options = []
+        if api_keys['gemini']:
+            provider_options.append("Gemini")
+        if api_keys['openai']:
+            provider_options.append("OpenAI")
+        
+        if not provider_options:
+            st.error("⚠️ No API keys configured!")
+            st.info("Add OPENAI_API_KEY or GEMINI_API_KEY to your .env file")
+        else:
+            provider = st.selectbox(
+                "AI Provider",
+                options=provider_options,
+                index=0 if "Gemini" in provider_options else 0
+            )
+            
+            if provider == "Gemini":
+                model = st.selectbox(
+                    "Model",
+                    options=["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash"],
+                    index=0
+                )
+                provider_key = "gemini"
+            else:
+                model = st.selectbox(
+                    "Model",
+                    options=["gpt-5", "gpt-4o", "gpt-4-turbo"],
+                    index=0
+                )
+                provider_key = "openai"
+            
+            # Update chatbot if model changed
+            if (provider_key != st.session_state.selected_provider or 
+                model != st.session_state.selected_model):
+                update_chatbot_model(provider_key, model)
+            
+            st.caption(f"✅ Using: {provider} - {model}")
+        
+        st.divider()
+        
         st.header("🌐 Website Configuration")
         
         url = st.text_input(
@@ -273,7 +428,7 @@ def main():
         else:
             append_mode = False
         
-        crawl_disabled = not api_key_configured
+        crawl_disabled = not (api_keys['openai'] or api_keys['gemini'])
         if st.button("🚀 Crawl & Build Knowledge Base", type="primary", use_container_width=True, disabled=crawl_disabled):
             if not url:
                 st.error("Please enter a URL")
@@ -285,7 +440,7 @@ def main():
                         st.rerun()
         
         if crawl_disabled:
-            st.warning("Add OpenAI API key to enable crawling")
+            st.warning("Add API key to .env file to enable crawling")
         
         st.divider()
         
@@ -365,7 +520,7 @@ def main():
             st.markdown("- 📊 Detailed crawl statistics dashboard")
             st.markdown("- 📚 Source citations with relevance scores")
         with col2:
-            st.markdown("- 🔄 Add or replace existing knowledge base")
+            st.markdown("- 🤖 Support for OpenAI and Google Gemini (embeddings + chat)")
             st.markdown("- ⚡ Fast semantic search with FAISS")
             st.markdown("- 💬 Conversational chat interface")
 

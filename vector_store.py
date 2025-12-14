@@ -1,57 +1,124 @@
 """
 Vector Store Module
-Handles embedding generation with OpenAI and vector storage/search with FAISS.
+Handles embedding generation with OpenAI/Gemini and vector storage/search with FAISS.
+Supports multiple embedding providers for flexibility.
 """
 
 import os
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from openai import OpenAI
+import google.generativeai as genai
+from dotenv import load_dotenv
 
-# the newest OpenAI model is "gpt-5" which was released August 7, 2025
-# do not change this unless explicitly requested by the user
+# Load environment variables
+load_dotenv()
 
 
 class VectorStore:
-    def __init__(self, embedding_model: str = "text-embedding-3-small"):
-        self.embedding_model = embedding_model
-        self.embedding_dim = 1536
+    def __init__(self, embedding_provider: str = "openai", embedding_model: str = None):
+        """
+        Initialize Vector Store
+        
+        Args:
+            embedding_provider: "openai" or "gemini"
+            embedding_model: Model name (auto-selected if None)
+        """
+        self.embedding_provider = embedding_provider.lower()
+        
+        # Set default models based on provider
+        if embedding_model is None:
+            if self.embedding_provider == "openai":
+                self.embedding_model = "text-embedding-3-small"
+            elif self.embedding_provider == "gemini":
+                self.embedding_model = "models/text-embedding-004"
+            else:
+                raise ValueError(f"Unsupported provider: {embedding_provider}")
+        else:
+            self.embedding_model = embedding_model
+        
+        # Set embedding dimensions based on provider and model
+        if self.embedding_provider == "openai":
+            if "text-embedding-3-small" in self.embedding_model:
+                self.embedding_dim = 1536
+            elif "text-embedding-3-large" in self.embedding_model:
+                self.embedding_dim = 3072
+            else:
+                self.embedding_dim = 1536  # Default
+        elif self.embedding_provider == "gemini":
+            self.embedding_dim = 768  # Gemini text-embedding-004 uses 768 dimensions
+        
         self.index = None
         self.chunks: List[Dict] = []
         self.client = None
         self._initialize_client()
     
     def _initialize_client(self):
-        """Initialize OpenAI client"""
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if api_key:
-            self.client = OpenAI(api_key=api_key)
+        """Initialize API client based on provider"""
+        if self.embedding_provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if api_key:
+                self.client = OpenAI(api_key=api_key)
+        
+        elif self.embedding_provider == "gemini":
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if api_key:
+                genai.configure(api_key=api_key)
+                self.client = True  # Flag to indicate configured
     
     def is_configured(self) -> bool:
-        """Check if OpenAI API is configured"""
+        """Check if API is configured"""
         return self.client is not None
     
     def generate_embedding(self, text: str) -> np.ndarray:
         """Generate embedding for a single text"""
         if not self.client:
-            raise ValueError("OpenAI API key not configured")
+            raise ValueError(f"{self.embedding_provider.upper()} API key not configured")
         
         text = text.replace("\n", " ").strip()
         if not text:
             return np.zeros(self.embedding_dim)
         
+        if self.embedding_provider == "openai":
+            return self._generate_embedding_openai(text)
+        elif self.embedding_provider == "gemini":
+            return self._generate_embedding_gemini(text)
+        else:
+            raise ValueError(f"Unsupported provider: {self.embedding_provider}")
+    
+    def _generate_embedding_openai(self, text: str) -> np.ndarray:
+        """Generate embedding using OpenAI"""
         response = self.client.embeddings.create(
             model=self.embedding_model,
             input=text
         )
         return np.array(response.data[0].embedding, dtype=np.float32)
     
+    def _generate_embedding_gemini(self, text: str) -> np.ndarray:
+        """Generate embedding using Gemini"""
+        result = genai.embed_content(
+            model=self.embedding_model,
+            content=text,
+            task_type="retrieval_document"
+        )
+        return np.array(result['embedding'], dtype=np.float32)
+    
     def generate_embeddings_batch(self, texts: List[str], 
                                    progress_callback=None) -> np.ndarray:
         """Generate embeddings for multiple texts in batches"""
         if not self.client:
-            raise ValueError("OpenAI API key not configured")
+            raise ValueError(f"{self.embedding_provider.upper()} API key not configured")
         
+        if self.embedding_provider == "openai":
+            return self._generate_embeddings_batch_openai(texts, progress_callback)
+        elif self.embedding_provider == "gemini":
+            return self._generate_embeddings_batch_gemini(texts, progress_callback)
+        else:
+            raise ValueError(f"Unsupported provider: {self.embedding_provider}")
+    
+    def _generate_embeddings_batch_openai(self, texts: List[str], 
+                                          progress_callback=None) -> np.ndarray:
+        """Generate embeddings using OpenAI (batch processing)"""
         all_embeddings = []
         batch_size = 100
         
@@ -66,6 +133,39 @@ class VectorStore:
             
             batch_embeddings = [np.array(item.embedding, dtype=np.float32) 
                                for item in response.data]
+            all_embeddings.extend(batch_embeddings)
+            
+            if progress_callback:
+                progress_callback(min(i + batch_size, len(texts)), len(texts))
+        
+        return np.array(all_embeddings)
+    
+    def _generate_embeddings_batch_gemini(self, texts: List[str], 
+                                          progress_callback=None) -> np.ndarray:
+        """Generate embeddings using Gemini (batch processing)"""
+        all_embeddings = []
+        batch_size = 100  # Gemini supports batch embedding
+        
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            cleaned_batch = [t.replace("\n", " ").strip() for t in batch]
+            
+            # Gemini can handle batches directly
+            result = genai.embed_content(
+                model=self.embedding_model,
+                content=cleaned_batch,
+                task_type="retrieval_document"
+            )
+            
+            # Handle both single and batch responses
+            if isinstance(result['embedding'][0], list):
+                # Batch response
+                batch_embeddings = [np.array(emb, dtype=np.float32) 
+                                   for emb in result['embedding']]
+            else:
+                # Single response
+                batch_embeddings = [np.array(result['embedding'], dtype=np.float32)]
+            
             all_embeddings.extend(batch_embeddings)
             
             if progress_callback:
@@ -128,7 +228,17 @@ class VectorStore:
         if self.index is None or not self.chunks:
             return []
         
-        query_embedding = self.generate_embedding(query)
+        # Generate query embedding with appropriate task type for Gemini
+        if self.embedding_provider == "gemini":
+            result = genai.embed_content(
+                model=self.embedding_model,
+                content=query.replace("\n", " ").strip(),
+                task_type="retrieval_query"  # Use query task type for search
+            )
+            query_embedding = np.array(result['embedding'], dtype=np.float32)
+        else:
+            query_embedding = self.generate_embedding(query)
+        
         query_embedding = query_embedding.reshape(1, -1)
         faiss.normalize_L2(query_embedding)
         
@@ -148,14 +258,18 @@ class VectorStore:
                 'indexed': False,
                 'num_vectors': 0,
                 'embedding_dim': self.embedding_dim,
-                'num_chunks': 0
+                'num_chunks': 0,
+                'provider': self.embedding_provider,
+                'model': self.embedding_model
             }
         
         return {
             'indexed': True,
             'num_vectors': self.index.ntotal,
             'embedding_dim': self.embedding_dim,
-            'num_chunks': len(self.chunks)
+            'num_chunks': len(self.chunks),
+            'provider': self.embedding_provider,
+            'model': self.embedding_model
         }
     
     def clear(self):

@@ -1,32 +1,53 @@
 """
 RAG Chatbot Module
 Implements the RAG pipeline: retrieve relevant chunks and generate answers using LLM.
+Supports both OpenAI (GPT) and Google Gemini models.
 """
 
 import os
 from typing import List, Dict, Tuple, Optional
 from openai import OpenAI
+import google.generativeai as genai
+from dotenv import load_dotenv
 
-# the newest OpenAI model is "gpt-5" which was released August 7, 2025
-# do not change this unless explicitly requested by the user
+# Load environment variables from .env file
+load_dotenv()
 
 
 class RAGChatbot:
-    def __init__(self, vector_store, model: str = "gpt-5"):
+    def __init__(self, vector_store, model: str = "gemini-2.0-flash", provider: str = "gemini"):
+        """
+        Initialize RAG Chatbot
+        
+        Args:
+            vector_store: Vector store for retrieving relevant chunks
+            model: Model name (e.g., "gpt-5", "gemini-2.0-flash-exp")
+            provider: "openai" or "gemini"
+        """
         self.vector_store = vector_store
         self.model = model
+        self.provider = provider.lower()
         self.client = None
         self.conversation_history: List[Dict] = []
         self._initialize_client()
     
     def _initialize_client(self):
-        """Initialize OpenAI client"""
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if api_key:
-            self.client = OpenAI(api_key=api_key)
+        """Initialize API client based on provider"""
+        if self.provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if api_key:
+                self.client = OpenAI(api_key=api_key)
+        
+        elif self.provider == "gemini":
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if api_key:
+                genai.configure(api_key=api_key)
+                self.client = genai.GenerativeModel(self.model)
+            else:
+                print("Warning: GEMINI_API_KEY not found in environment variables")
     
     def is_configured(self) -> bool:
-        """Check if OpenAI API is configured"""
+        """Check if API is configured"""
         return self.client is not None
     
     def retrieve_context(self, query: str, top_k: int = 5) -> List[Tuple[Dict, float]]:
@@ -69,12 +90,47 @@ class RAGChatbot:
         
         return sources
     
+    def _generate_with_openai(self, messages: List[Dict]) -> str:
+        """Generate response using OpenAI API"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_completion_tokens=1024
+        )
+        return response.choices[0].message.content
+    
+    def _generate_with_gemini(self, system_prompt: str, user_message: str, 
+                               include_history: bool) -> str:
+        """Generate response using Gemini API"""
+        # Gemini uses a different conversation format
+        if include_history and self.conversation_history:
+            # Build conversation history for Gemini
+            chat = self.client.start_chat(history=[])
+            
+            # Add system instruction as first message
+            full_prompt = f"{system_prompt}\n\n{user_message}"
+            
+            # Add conversation history
+            for msg in self.conversation_history[-6:]:  # Last 3 exchanges
+                if msg['role'] == 'user':
+                    chat.send_message(msg['content'])
+                # Assistant messages are automatically added by Gemini
+            
+            # Send current message
+            response = chat.send_message(full_prompt)
+        else:
+            # No history - single message
+            full_prompt = f"{system_prompt}\n\n{user_message}"
+            response = self.client.generate_content(full_prompt)
+        
+        return response.text
+    
     def generate_answer(self, query: str, top_k: int = 5, 
                         include_history: bool = True) -> Dict:
         """Generate answer using RAG pipeline"""
         if not self.client:
             return {
-                'answer': "Error: OpenAI API key not configured. Please add your API key.",
+                'answer': f"Error: {self.provider.upper()} API key not configured. Please add your API key to the .env file.",
                 'sources': [],
                 'context_used': False
             }
@@ -110,26 +166,32 @@ User Question: {query}
 
 Please answer the question based on the context provided above."""
 
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        if include_history and self.conversation_history:
-            recent_history = self.conversation_history[-6:]
-            messages.extend(recent_history)
-        
-        messages.append({"role": "user", "content": user_message})
-        
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_completion_tokens=1024
-            )
+            if self.provider == "openai":
+                messages = [{"role": "system", "content": system_prompt}]
+                
+                if include_history and self.conversation_history:
+                    recent_history = self.conversation_history[-6:]
+                    messages.extend(recent_history)
+                
+                messages.append({"role": "user", "content": user_message})
+                answer = self._generate_with_openai(messages)
             
-            answer = response.choices[0].message.content
+            elif self.provider == "gemini":
+                answer = self._generate_with_gemini(system_prompt, user_message, include_history)
             
+            else:
+                return {
+                    'answer': f"Error: Unsupported provider '{self.provider}'",
+                    'sources': sources,
+                    'context_used': False
+                }
+            
+            # Update conversation history
             self.conversation_history.append({"role": "user", "content": query})
             self.conversation_history.append({"role": "assistant", "content": answer})
             
+            # Keep history manageable
             if len(self.conversation_history) > 20:
                 self.conversation_history = self.conversation_history[-20:]
             
@@ -137,7 +199,8 @@ Please answer the question based on the context provided above."""
                 'answer': answer,
                 'sources': sources,
                 'context_used': True,
-                'chunks_retrieved': len(retrieved_chunks)
+                'chunks_retrieved': len(retrieved_chunks),
+                'model_used': f"{self.provider}/{self.model}"
             }
             
         except Exception as e:
@@ -156,5 +219,7 @@ Please answer the question based on the context provided above."""
         """Get summary of current conversation"""
         return {
             'num_messages': len(self.conversation_history),
-            'has_context': self.vector_store.index is not None
+            'has_context': self.vector_store.index is not None,
+            'provider': self.provider,
+            'model': self.model
         }

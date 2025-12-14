@@ -1,0 +1,9 @@
+streamlit
+openai
+google-generativeai
+python-dotenv
+beautifulsoup4
+requests
+faiss-cpu
+sentence-transformers
+numpy
